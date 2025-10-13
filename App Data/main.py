@@ -10,6 +10,7 @@ import threading
 from pathlib import Path
 from enum import Enum
 from typing import SupportsBytes
+import shutil  # <-- added
 
 # ---- Optional global hotkeys (works even when tray is hidden) ----
 try:
@@ -172,6 +173,18 @@ class ConvertWorker(QObject):
                                         mode="w",newline="",encoding="utf-8")
         w=csv.writer(tmp); w.writerow(("timestamp","key","type","value","meta")); w.writerows(rows)
         path=tmp.name; tmp.close()
+
+        # --- persist a copy next to the original log for debugging ---
+        try:
+            dest = self.filepath.with_suffix(".csv")
+            if dest.exists():
+                # avoid overwrite: add epoch timestamp
+                dest = dest.with_name(f"{dest.stem}_{int(time.time())}.csv")
+            shutil.copyfile(path, dest)
+            print(f"[convert] Saved CSV copy: {dest}")
+        except Exception as e:
+            print(f"[convert] Failed to save CSV copy: {e}")
+
         self.finished.emit(path)
 
 
@@ -306,22 +319,70 @@ class Controller(QObject):
         self.timestamps=[r[0] for r in self.log]
         total=len(self.log); duration=self.timestamps[-1] if total else 1.0
 
-        flags={"enabled":False,"autonomous":False,"estop":False}
-        def state():
-            if flags["estop"]: return "estop"
-            if not flags["enabled"]: return "disabled"
-            if flags["autonomous"]: return "autonomous"
-            return "teleop"
-        segs=[]; cur=state(); st=0.0
-        for ts,key,_,val,_ in self.log:
-            if key.startswith("DS:"):
-                f=key.split("DS:")[1]
-                if f in flags:
-                    flags[f]=(val=="True")
-                    ns=state()
-                    if ns!=cur:
-                        segs.append((st,ts,cur)); cur=ns; st=ts
-        segs.append((st,duration,cur))
+        # --- Build segments ---
+        segs=[]
+        # First try DS: flags (your original behavior)
+        has_ds = any(k.startswith("DS:") for _,k,_,_,_ in self.log)
+        if has_ds:
+            flags={"enabled":False,"autonomous":False,"estop":False}
+            def state():
+                if flags["estop"]: return "estop"
+                if not flags["enabled"]: return "disabled"
+                if flags["autonomous"]: return "autonomous"
+                return "teleop"
+            cur=state(); st=0.0
+            for ts,key,_,val,_ in self.log:
+                if key.startswith("DS:"):
+                    f=key.split("DS:")[1]
+                    if f in flags:
+                        flags[f]=(val=="True")
+                        ns=state()
+                        if ns!=cur:
+                            segs.append((st,ts,cur)); cur=ns; st=ts
+            segs.append((st,duration,cur))
+        else:
+            # Fallback: decode NT:/FMSInfo/FMSControlData using your mapping:
+            # 51 -> autonomous, 49 -> teleop, 50/0/NaN/invalid -> disabled
+
+            def _to_int_or_none(s: str):
+                try:
+                    # accepts "49", "49.0", " 50 ", etc.
+                    return int(float(s))
+                except Exception:
+                    return None
+
+            def decode_state(mask: int | None) -> str:
+                if mask == 51:
+                    return "autonomous"
+                if mask == 49:
+                    return "teleop"
+                # 50, 0, None/NaN/invalid -> disabled
+                return "disabled"
+
+            # Collect rows (keep order); include even invalid ones so we can mark transitions when they become valid
+            fms_rows = [(ts, _to_int_or_none(val))
+                        for ts, key, _, val, _ in self.log
+                        if key == "NT:/FMSInfo/FMSControlData"]
+
+            if not fms_rows:
+                # No way to infer; assume disabled for entire duration
+                segs = [(0.0, duration, "disabled")]
+            else:
+                # Start explicitly as DISABLED until first valid transition shows up
+                cur_state = "disabled"
+                st = 0.0
+                for ts, mask in fms_rows:
+                    ns = decode_state(mask)
+                    if ns != cur_state:
+                        if ts > st:
+                            segs.append((st, ts, cur_state))
+                        cur_state = ns
+                        st = ts
+                # tail
+                if duration > st:
+                    segs.append((st, duration, cur_state))
+
+
         self.segments=segs
 
         self.loaded.emit(total,duration)
@@ -331,6 +392,7 @@ class Controller(QObject):
             self.backend.start(self.nt_host, self.nt_port, self.csv_path)
         except Exception as e:
             print("Backend preload failed:", e)
+
 
     def toggle_publish(self):
         self.is_publishing = not self.is_publishing
